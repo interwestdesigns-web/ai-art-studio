@@ -14,11 +14,29 @@ FAL_KEY = '5f33e30e-2a41-433e-9bbf-8feac36bc427:b7ea1537626da5060dbbf75230e40b3a
 def home():
     return "AI Art Studio Backend is running! ✓"
 
-@app.route('/generate-prompts', methods=['POST'])
-def generate_prompts():
-    """Generate image prompts using Claude API"""
+@app.route('/api', methods=['POST'])
+def api_dispatch():
+    """Main API endpoint that dispatches requests based on action"""
     try:
         data = request.json
+        action = data.get('action')
+        
+        if action == 'generate-prompts':
+            return generate_prompts_handler(data)
+        elif action == 'generate-images':
+            return generate_images_handler(data)
+        elif action == 'remove-background':
+            return remove_background_handler(data)
+        else:
+            return jsonify({'error': f'Unknown action: {action}'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def generate_prompts_handler(data=None):
+    """Generate image prompts using Claude API"""
+    try:
+        if data is None:
+            data = request.json
         description = data.get('description')
         ratio = data.get('ratio')
         
@@ -64,10 +82,11 @@ Format: Just list 4 prompts, one per line, no numbering.'''
         return jsonify({'error': str(e)}), 500
 
 @app.route('/generate-images', methods=['POST'])
-def generate_images():
+def generate_images_handler(data=None):
     """Generate images using fal.ai"""
     try:
-        data = request.json
+        if data is None:
+            data = request.json
         prompts = data.get('prompts', [])
         model = data.get('model')
         ratio = data.get('ratio')
@@ -106,10 +125,11 @@ def generate_images():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/remove-background', methods=['POST'])
-def remove_background():
+def remove_background_handler(data=None):
     """Remove background from image using Bria RMBG"""
     try:
-        data = request.json
+        if data is None:
+            data = request.json
         image_urls = data.get('image_urls', [])
         
         if not image_urls:
