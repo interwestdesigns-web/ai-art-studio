@@ -1,29 +1,18 @@
 from flask import Flask, request, jsonify
-from flask_cors import CORS
 import requests
 import os
+from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+
+CORS(app, 
+     origins=["*"],
+     methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"],
+     supports_credentials=False)
 
 CLAUDE_KEY = os.getenv('CLAUDE_API_KEY')
 FAL_KEY = os.getenv('FAL_API_KEY')
-
-@app.before_request
-def handle_preflight():
-    if request.method == "OPTIONS":
-        response = app.make_default_options_response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type")
-        response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        return response
-
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
-    return response
 
 @app.route('/')
 def home():
@@ -32,7 +21,7 @@ def home():
 @app.route('/api', methods=['POST', 'OPTIONS'])
 def api():
     if request.method == 'OPTIONS':
-        return '', 200
+        return '', 204
     
     try:
         data = request.json
@@ -54,12 +43,10 @@ def api():
                     'max_tokens': 1024,
                     'messages': [{
                         'role': 'user',
-                        'content': f'''Generate 4 unique, detailed image prompts for wall art.
-User: {description}
-Ratio: {ratio}
-Format: 4 prompts, one per line.'''
+                        'content': f'Generate 4 prompts for wall art. User: {description}. Ratio: {ratio}. Format: one per line.'
                     }]
-                }
+                },
+                timeout=30
             )
             
             if response.status_code == 200:
@@ -78,7 +65,8 @@ Format: 4 prompts, one per line.'''
                     resp = requests.post(
                         f'https://queue.fal.run/{model}',
                         headers={'Authorization': f'Key {FAL_KEY}', 'Content-Type': 'application/json'},
-                        json={'prompt': prompt, 'image_size': 'landscape', 'num_inference_steps': 30}
+                        json={'prompt': prompt, 'image_size': 'landscape', 'num_inference_steps': 30},
+                        timeout=60
                     )
                     if resp.status_code == 200:
                         result = resp.json()
@@ -98,7 +86,8 @@ Format: 4 prompts, one per line.'''
                     resp = requests.post(
                         'https://queue.fal.run/fal-ai/bria/background/remove',
                         headers={'Authorization': f'Key {FAL_KEY}', 'Content-Type': 'application/json'},
-                        json={'image_url': url}
+                        json={'image_url': url},
+                        timeout=60
                     )
                     if resp.status_code == 200:
                         result = resp.json()
