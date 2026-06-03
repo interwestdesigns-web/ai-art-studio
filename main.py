@@ -6,37 +6,35 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# Your API Keys (stored securely on server, not exposed to client)
-CLAUDE_KEY = 'api03-9jgj584vxMTeHgiP-2EcAW7fFcfhSWw00zTs8mwwphkjXl9BiSFQWM7Ir1LqgFc-5VzoZazQJnY9V1oqMFo0cQ-bZUjCQAA'
-FAL_KEY = '5f33e30e-2a41-433e-9bbf-8feac36bc427:b7ea1537626da5060dbbf75230e40b3a'
+# API Keys from environment variables
+CLAUDE_KEY = os.getenv('CLAUDE_API_KEY', 'api03-9jgj584vxMTeHgiP-2EcAW7fFcfhSWw00zTs8mwwphkjXl9BiSFQWM7Ir1LqgFc-5VzoZazQJnY9V1oqMFo0cQ-bZUjCQAA')
+FAL_KEY = os.getenv('FAL_API_KEY', '5f33e30e-2a41-433e-9bbf-8feac36bc427:b7ea1537626da5060dbbf75230e40b3a')
 
 @app.route('/')
 def home():
     return "AI Art Studio Backend is running! ✓"
 
 @app.route('/api', methods=['POST'])
-def api_dispatch():
-    """Main API endpoint that dispatches requests based on action"""
+def api():
+    """Main API endpoint"""
     try:
         data = request.json
         action = data.get('action')
         
         if action == 'generate-prompts':
-            return generate_prompts_handler(data)
+            return generate_prompts(data)
         elif action == 'generate-images':
-            return generate_images_handler(data)
+            return generate_images(data)
         elif action == 'remove-background':
-            return remove_background_handler(data)
+            return remove_background(data)
         else:
             return jsonify({'error': f'Unknown action: {action}'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-def generate_prompts_handler(data=None):
+def generate_prompts(data):
     """Generate image prompts using Claude API"""
     try:
-        if data is None:
-            data = request.json
         description = data.get('description')
         ratio = data.get('ratio')
         
@@ -73,20 +71,17 @@ Format: Just list 4 prompts, one per line, no numbering.'''
         if response.status_code != 200:
             return jsonify({'error': f'Claude API error: {response.text}'}), 500
         
-        data = response.json()
-        prompts = [p.strip() for p in data['content'][0]['text'].split('\n') if p.strip()][:4]
+        result = response.json()
+        prompts = [p.strip() for p in result['content'][0]['text'].split('\n') if p.strip()][:4]
         
         return jsonify({'prompts': prompts})
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/generate-images', methods=['POST'])
-def generate_images_handler(data=None):
+def generate_images(data):
     """Generate images using fal.ai"""
     try:
-        if data is None:
-            data = request.json
         prompts = data.get('prompts', [])
         model = data.get('model')
         ratio = data.get('ratio')
@@ -116,7 +111,7 @@ def generate_images_handler(data=None):
                     if result.get('output') and result['output'].get('image'):
                         generated_images.append(result['output']['image']['url'])
             except Exception as e:
-                print(f"Error generating image for prompt: {e}")
+                print(f"Error generating image: {e}")
                 continue
         
         return jsonify({'images': generated_images})
@@ -124,12 +119,9 @@ def generate_images_handler(data=None):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-@app.route('/remove-background', methods=['POST'])
-def remove_background_handler(data=None):
+def remove_background(data):
     """Remove background from image using Bria RMBG"""
     try:
-        if data is None:
-            data = request.json
         image_urls = data.get('image_urls', [])
         
         if not image_urls:
