@@ -4,7 +4,14 @@ import requests
 import os
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "*"}})
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS, GET'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
 
 # Get API keys from environment variables
 CLAUDE_KEY = os.getenv('CLAUDE_API_KEY')
@@ -14,9 +21,12 @@ FAL_KEY = os.getenv('FAL_API_KEY')
 def home():
     return "AI Art Studio Backend is running! ✓"
 
-@app.route('/api', methods=['POST'])
+@app.route('/api', methods=['POST', 'OPTIONS'])
 def api():
     """Main API endpoint that dispatches based on action"""
+    if request.method == 'OPTIONS':
+        return '', 200
+    
     try:
         data = request.json
         action = data.get('action')
