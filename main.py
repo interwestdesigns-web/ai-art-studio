@@ -10,32 +10,67 @@ CORS(app)
 
 # ---------------------------------------------------------------------------
 # Config -- set these as ENVIRONMENT VARIABLES in Railway (Variables tab).
-# Do NOT hardcode keys here.
 # ---------------------------------------------------------------------------
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FAL_KEY = os.environ.get("FAL_KEY", "")
-# If prompts ever fail with a "model" error, just change this env var --
-# no code edit needed. Good fallbacks: claude-opus-4-8, claude-haiku-4-5-20251001
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
-# Aspect ratio -> (width, height) used when generating images.
+# Aspect ratio -> (width, height). All multiples of 16 (required by GPT Image 2)
+# with the short edge kept >= 1024 (required by Seedream).
 RATIO_DIMS = {
     "2:3": (1024, 1536),
     "3:4": (1152, 1536),
     "4:5": (1024, 1280),
-    "5:7": (1097, 1536),
-    "11:14": (1206, 1536),
-    "A-Series": (1086, 1536),
+    "5:7": (1024, 1440),
+    "11:14": (1216, 1536),
+    "A-Series": (1088, 1536),
     "Square": (1024, 1024),
-    "16:9": (1536, 864),
+    "16:9": (1824, 1024),
+}
+
+# Nano Banana uses aspect-ratio strings, not pixel sizes. Map each ratio to the
+# nearest value fal supports: auto,21:9,16:9,3:2,4:3,5:4,1:1,4:5,3:4,2:3,9:16
+ASPECT_MAP = {
+    "2:3": "2:3", "3:4": "3:4", "4:5": "4:5",
+    "5:7": "3:4", "11:14": "4:5", "A-Series": "2:3",
+    "Square": "1:1", "16:9": "16:9",
+}
+
+# Each model needs its correct fal endpoint + its own parameter style.
+# The frontend keeps sending its friendly id; the backend translates here.
+MODEL_CONFIG = {
+    "openai/gpt-image-2": {
+        "endpoint": "openai/gpt-image-2",
+        "size": "image_size",
+        "extra": {"quality": "medium"},   # "high" is much slower; "medium" is a good default
+    },
+    "fal-ai/flux-2-pro": {
+        "endpoint": "fal-ai/flux-2-pro",
+        "size": "image_size",
+        "extra": {},
+    },
+    "fal-ai/nano-banana-pro": {
+        "endpoint": "fal-ai/nano-banana-pro",
+        "size": "aspect_ratio",
+        "extra": {},
+    },
+    "fal-ai/seedream-v4-5": {
+        "endpoint": "fal-ai/bytedance/seedream/v4/text-to-image",
+        "size": "image_size",
+        "extra": {},
+    },
+    "fal-ai/recraft-v4": {
+        "endpoint": "fal-ai/recraft/v4.1/pro/text-to-image",
+        "size": "image_size",
+        "extra": {"style": "realistic_image"},
+    },
 }
 
 
 @app.route("/", methods=["GET"])
 def home():
-    """Health check -- visit this URL in a browser to confirm keys are loaded."""
     return jsonify({
         "message": "AI Art Studio backend is running",
         "anthropic_key_set": bool(ANTHROPIC_API_KEY),
@@ -46,16 +81,15 @@ def home():
 
 @app.route("/api", methods=["POST"])
 def api():
-    """Single endpoint the frontend talks to. Branches on the 'action' field."""
     data = request.get_json(silent=True) or {}
     action = data.get("action")
 
     if action == "generate-prompts":
         return generate_prompts(data)
     if action == "generate-images":
-        return generate_images(data)      # submits jobs to the fal.ai queue
+        return generate_images(data)
     if action == "poll-images":
-        return poll_images(data)          # checks job status, returns finished images
+        return poll_images(data)
     if action == "remove-background":
         return remove_background(data)
 
@@ -106,10 +140,7 @@ def generate_prompts(data):
         return jsonify({"prompts": [], "error": f"Request to Anthropic failed: {e}"}), 200
 
     if resp.status_code != 200:
-        return jsonify({
-            "prompts": [],
-            "error": f"Anthropic API {resp.status_code}: {resp.text[:500]}"
-        }), 200
+        return jsonify({"prompts": [], "error": f"Anthropic API {resp.status_code}: {resp.text[:500]}"}), 200
 
     payload = resp.json()
     text = "".join(
@@ -120,10 +151,7 @@ def generate_prompts(data):
 
     prompts = parse_prompts(text)
     if not prompts:
-        return jsonify({
-            "prompts": [],
-            "error": f"Could not parse prompts from model output: {text[:300]}"
-        }), 200
+        return jsonify({"prompts": [], "error": f"Could not parse prompts: {text[:300]}"}), 200
 
     return jsonify({"prompts": prompts[:4]}), 200
 
@@ -141,9 +169,29 @@ def parse_prompts(text):
 
 
 # ---------------------------------------------------------------------------
-# 2) Generate images with fal.ai -- QUEUE pattern (submit fast, poll later)
-#    This keeps every request short so the Netlify proxy never times out.
+# 2) Generate images with fal.ai (queue: submit fast, poll later)
 # ---------------------------------------------------------------------------
+def build_input(model, ratio, prompt):
+    """Return (fal_endpoint, input_payload) tailored to the chosen model."""
+    cfg = MODEL_CONFIG.get(model)
+    payload = {"prompt": prompt, "num_images": 1}
+
+    if cfg is None:
+        # Unknown model -> default to FLUX-style {width,height}.
+        w, h = RATIO_DIMS.get(ratio, (1024, 1024))
+        payload["image_size"] = {"width": w, "height": h}
+        return model, payload
+
+    if cfg["size"] == "image_size":
+        w, h = RATIO_DIMS.get(ratio, (1024, 1024))
+        payload["image_size"] = {"width": w, "height": h}
+    elif cfg["size"] == "aspect_ratio":
+        payload["aspect_ratio"] = ASPECT_MAP.get(ratio, "1:1")
+
+    payload.update(cfg.get("extra", {}))
+    return cfg["endpoint"], payload
+
+
 def generate_images(data):
     prompts = data.get("prompts", [])
     model = (data.get("model") or "").strip()
@@ -154,40 +202,34 @@ def generate_images(data):
     if not prompts or not model:
         return jsonify({"jobs": [], "error": "Missing prompts or model"}), 200
 
-    width, height = RATIO_DIMS.get(ratio, (1024, 1024))
     jobs, errors = [], []
 
     for p in prompts:
+        endpoint, payload = build_input(model, ratio, p)
         try:
             r = requests.post(
-                f"https://queue.fal.run/{model}",
+                f"https://queue.fal.run/{endpoint}",
                 headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
-                json={"prompt": p, "image_size": {"width": width, "height": height}, "num_images": 1},
+                json=payload,
                 timeout=30,
             )
             if r.status_code not in (200, 201):
-                errors.append(f"{model} {r.status_code}: {r.text[:200]}")
+                errors.append(f"{endpoint} {r.status_code}: {r.text[:200]}")
                 continue
             body = r.json()
             rid = body.get("request_id")
             status_url = body.get("status_url")
             response_url = body.get("response_url")
             if rid and status_url and response_url:
-                # Use the URLs fal hands back -- never construct them by hand.
-                jobs.append({
-                    "request_id": rid,
-                    "status_url": status_url,
-                    "response_url": response_url,
-                })
+                jobs.append({"request_id": rid, "status_url": status_url, "response_url": response_url})
             elif rid:
-                # Fallback if fal omits the URLs (uses base app id, not subpaths).
                 jobs.append({
                     "request_id": rid,
-                    "status_url": f"https://queue.fal.run/{model}/requests/{rid}/status",
-                    "response_url": f"https://queue.fal.run/{model}/requests/{rid}",
+                    "status_url": f"https://queue.fal.run/{endpoint}/requests/{rid}/status",
+                    "response_url": f"https://queue.fal.run/{endpoint}/requests/{rid}",
                 })
             else:
-                errors.append(f"No request_id in response: {str(body)[:200]}")
+                errors.append(f"No request_id: {str(body)[:200]}")
         except Exception as e:
             errors.append(str(e))
 
@@ -214,7 +256,6 @@ def poll_images(data):
         try:
             s = requests.get(status_url, headers=auth, timeout=30)
             if s.status_code not in (200, 202):
-                # 200/202 both carry a valid status body; anything else is a real error.
                 errors.append(f"Status check {s.status_code}: {s.text[:200]}")
                 continue
             sbody = s.json()
@@ -235,11 +276,11 @@ def poll_images(data):
                 else:
                     errors.append(f"Result fetch {res.status_code}: {res.text[:200]}")
             elif status in ("IN_QUEUE", "IN_PROGRESS"):
-                pending.append(job)        # still working -- keep polling
+                pending.append(job)
             else:
                 errors.append(f"Status '{status}': {str(sbody)[:200]}")
         except Exception as e:
-            pending.append(job)            # transient error -- try again next poll
+            pending.append(job)
             errors.append(str(e))
 
     return jsonify({"images": images, "jobs": pending, "errors": errors}), 200
