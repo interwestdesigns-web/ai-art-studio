@@ -90,6 +90,8 @@ def api():
         return generate_images(data)
     if action == "poll-images":
         return poll_images(data)
+    if action == "cancel-images":
+        return cancel_images(data)
     if action == "remove-background":
         return remove_background(data)
 
@@ -220,13 +222,19 @@ def generate_images(data):
             rid = body.get("request_id")
             status_url = body.get("status_url")
             response_url = body.get("response_url")
+            cancel_url = body.get("cancel_url")
             if rid and status_url and response_url:
-                jobs.append({"request_id": rid, "status_url": status_url, "response_url": response_url})
+                job = {"request_id": rid, "status_url": status_url, "response_url": response_url}
+                if cancel_url:
+                    job["cancel_url"] = cancel_url
+                jobs.append(job)
             elif rid:
+                base = f"https://queue.fal.run/{endpoint}/requests/{rid}"
                 jobs.append({
                     "request_id": rid,
-                    "status_url": f"https://queue.fal.run/{endpoint}/requests/{rid}/status",
-                    "response_url": f"https://queue.fal.run/{endpoint}/requests/{rid}",
+                    "status_url": f"{base}/status",
+                    "response_url": base,
+                    "cancel_url": f"{base}/cancel",
                 })
             else:
                 errors.append(f"No request_id: {str(body)[:200]}")
@@ -284,6 +292,31 @@ def poll_images(data):
             errors.append(str(e))
 
     return jsonify({"images": images, "jobs": pending, "errors": errors}), 200
+
+
+def cancel_images(data):
+    """Ask fal to cancel jobs still waiting in the queue (saves cost).
+    Jobs already running can't be un-billed, but queued ones can be stopped."""
+    jobs = data.get("jobs", [])
+    if not FAL_KEY:
+        return jsonify({"cancelled": 0, "errors": ["FAL_KEY is not set on the server"]}), 200
+
+    cancelled, errors = 0, []
+    auth = {"Authorization": f"Key {FAL_KEY}"}
+    for job in jobs:
+        cancel_url = job.get("cancel_url")
+        if not cancel_url:
+            continue
+        try:
+            r = requests.put(cancel_url, headers=auth, timeout=20)
+            if r.status_code in (200, 202):
+                cancelled += 1
+            else:
+                errors.append(f"{r.status_code}: {r.text[:150]}")
+        except Exception as e:
+            errors.append(str(e))
+
+    return jsonify({"cancelled": cancelled, "errors": errors}), 200
 
 
 # ---------------------------------------------------------------------------
