@@ -53,7 +53,9 @@ def api():
     if action == "generate-prompts":
         return generate_prompts(data)
     if action == "generate-images":
-        return generate_images(data)
+        return generate_images(data)      # submits jobs to the fal.ai queue
+    if action == "poll-images":
+        return poll_images(data)          # checks job status, returns finished images
     if action == "remove-background":
         return remove_background(data)
 
@@ -128,20 +130,19 @@ def generate_prompts(data):
 
 def parse_prompts(text):
     cleaned = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
-    # Preferred: a clean JSON array
     try:
         arr = json.loads(cleaned)
         if isinstance(arr, list):
             return [str(x).strip() for x in arr if str(x).strip()]
     except Exception:
         pass
-    # Fallback: split lines, drop "1." / "1)" numbering and short fragments
     lines = [re.sub(r"^\s*\d+[\.\)]\s*", "", ln).strip() for ln in cleaned.split("\n")]
     return [ln for ln in lines if len(ln) > 15]
 
 
 # ---------------------------------------------------------------------------
-# 2) Generate images with fal.ai
+# 2) Generate images with fal.ai -- QUEUE pattern (submit fast, poll later)
+#    This keeps every request short so the Netlify proxy never times out.
 # ---------------------------------------------------------------------------
 def generate_images(data):
     prompts = data.get("prompts", [])
@@ -149,43 +150,87 @@ def generate_images(data):
     ratio = (data.get("ratio") or "Square").strip()
 
     if not FAL_KEY:
-        return jsonify({"images": [], "error": "FAL_KEY is not set on the server"}), 200
+        return jsonify({"jobs": [], "error": "FAL_KEY is not set on the server"}), 200
     if not prompts or not model:
-        return jsonify({"images": [], "error": "Missing prompts or model"}), 200
+        return jsonify({"jobs": [], "error": "Missing prompts or model"}), 200
 
     width, height = RATIO_DIMS.get(ratio, (1024, 1024))
-    images, errors = [], []
+    jobs, errors = [], []
 
     for p in prompts:
         try:
             r = requests.post(
-                f"https://fal.run/{model}",
-                headers={
-                    "Authorization": f"Key {FAL_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "prompt": p,
-                    "image_size": {"width": width, "height": height},
-                    "num_images": 1,
-                },
-                timeout=180,
+                f"https://queue.fal.run/{model}",
+                headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
+                json={"prompt": p, "image_size": {"width": width, "height": height}, "num_images": 1},
+                timeout=30,
             )
-            if r.status_code != 200:
+            if r.status_code not in (200, 201):
                 errors.append(f"{model} {r.status_code}: {r.text[:200]}")
                 continue
             body = r.json()
-            for img in body.get("images", []):
-                url = img.get("url") if isinstance(img, dict) else img
-                if url:
-                    images.append(url)
+            rid = body.get("request_id")
+            if rid:
+                jobs.append({"request_id": rid, "model": model})
+            else:
+                errors.append(f"No request_id in response: {str(body)[:200]}")
         except Exception as e:
             errors.append(str(e))
 
-    out = {"images": images}
+    out = {"jobs": jobs}
     if errors:
         out["error"] = " | ".join(errors[:4])
     return jsonify(out), 200
+
+
+def poll_images(data):
+    jobs = data.get("jobs", [])
+    if not FAL_KEY:
+        return jsonify({"images": [], "jobs": [], "errors": ["FAL_KEY is not set on the server"]}), 200
+
+    images, pending, errors = [], [], []
+
+    for job in jobs:
+        rid = job.get("request_id")
+        model = job.get("model")
+        if not rid or not model:
+            continue
+        try:
+            s = requests.get(
+                f"https://queue.fal.run/{model}/requests/{rid}/status",
+                headers={"Authorization": f"Key {FAL_KEY}"},
+                timeout=30,
+            )
+            sbody = s.json() if s.status_code == 200 else {}
+            status = sbody.get("status")
+
+            if status == "COMPLETED":
+                res = requests.get(
+                    f"https://queue.fal.run/{model}/requests/{rid}",
+                    headers={"Authorization": f"Key {FAL_KEY}"},
+                    timeout=60,
+                )
+                if res.status_code == 200:
+                    rb = res.json()
+                    found = False
+                    for img in rb.get("images", []):
+                        url = img.get("url") if isinstance(img, dict) else img
+                        if url:
+                            images.append(url)
+                            found = True
+                    if not found:
+                        errors.append(f"Completed but no image url: {str(rb)[:200]}")
+                else:
+                    errors.append(f"Result fetch {res.status_code}: {res.text[:200]}")
+            elif status in ("IN_QUEUE", "IN_PROGRESS"):
+                pending.append(job)        # still working -- keep polling
+            else:
+                errors.append(f"Status '{status}': {str(sbody)[:200]}")
+        except Exception as e:
+            pending.append(job)            # transient error -- try again next poll
+            errors.append(str(e))
+
+    return jsonify({"images": images, "jobs": pending, "errors": errors}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +246,7 @@ def remove_background(data):
         try:
             r = requests.post(
                 "https://fal.run/fal-ai/bria/background/remove",
-                headers={
-                    "Authorization": f"Key {FAL_KEY}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
                 json={"image_url": url},
                 timeout=180,
             )
