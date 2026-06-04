@@ -207,18 +207,26 @@ def generate_prompts(data):
     description = (data.get("description") or "").strip()
     ratio = (data.get("ratio") or "").strip()
     orientation = (data.get("orientation") or "Portrait").strip()
+    images = data.get("images", []) or []
 
     if not ANTHROPIC_API_KEY:
         return jsonify({"prompts": [], "error": "ANTHROPIC_API_KEY is not set on the server"}), 200
-    if not description:
-        return jsonify({"prompts": [], "error": "Missing description"}), 200
+    if not description and not images:
+        return jsonify({"prompts": [], "error": "Provide a description, one or more images, or both"}), 200
+
+    if images and description:
+        intro = f"Use the attached image(s) as visual inspiration, along with this description: {description}\n"
+    elif images:
+        intro = "Use the attached image(s) as the visual inspiration for the artwork (subject, style, mood, palette).\n"
+    else:
+        intro = f"Customer description: {description}\n"
 
     instruction = (
         "You write prompts for an AI image generator that creates beautiful, "
         "print-ready wall art.\n\n"
-        f"Customer description: {description}\n"
+        + intro +
         f"Aspect ratio: {ratio or 'unspecified'} ({orientation})\n\n"
-        "Write 4 distinct, vivid image-generation prompts based on the description. "
+        "Write 4 distinct, vivid image-generation prompts. "
         f"Compose each for a {orientation.lower()} orientation. "
         "Each prompt should be 2-3 sentences and specify subject, style, mood, color "
         "palette, lighting, and composition. Vary the artistic style across the 4 so "
@@ -226,6 +234,15 @@ def generate_prompts(data):
         "Return ONLY a JSON array of 4 strings and nothing else -- no markdown, no keys, "
         "no commentary. Example: [\"prompt one\", \"prompt two\", \"prompt three\", \"prompt four\"]"
     )
+
+    # Build multimodal message content: images first, then the text instruction.
+    content = []
+    for im in images[:6]:
+        b64 = im.get("data") or ""
+        mt = im.get("media_type") or "image/jpeg"
+        if b64:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}})
+    content.append({"type": "text", "text": instruction})
 
     try:
         resp = requests.post(
@@ -238,9 +255,9 @@ def generate_prompts(data):
             json={
                 "model": ANTHROPIC_MODEL,
                 "max_tokens": 1500,
-                "messages": [{"role": "user", "content": instruction}],
+                "messages": [{"role": "user", "content": content}],
             },
-            timeout=60,
+            timeout=90,
         )
     except Exception as e:
         return jsonify({"prompts": [], "error": f"Request to Anthropic failed: {e}"}), 200
