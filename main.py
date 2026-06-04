@@ -1,9 +1,11 @@
 import os
 import re
+import io
 import json
 import requests
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from PIL import Image
 
 app = Flask(__name__)
 CORS(app)
@@ -15,11 +17,18 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 FAL_KEY = os.environ.get("FAL_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
+# Faithful 4x upscaler. Swap to "fal-ai/clarity-upscaler" for more aggressive
+# detail enhancement (it can invent detail). Overridable without code changes.
+FAL_UPSCALER = os.environ.get("FAL_UPSCALER", "fal-ai/aura-sr")
+
+# Safety cap on final image size (pixels) to protect server memory. 40MP covers
+# up to ~16x20 / 18x24 at full 300 DPI. Raise if your Railway plan has the RAM.
+MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "40000000"))
+
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
 # Aspect ratio -> (width, height) in PORTRAIT form (width <= height). All
-# multiples of 16 (GPT Image 2) with short edge >= 1024 (Seedream). When the
-# user picks Landscape, the backend swaps width<->height.
+# multiples of 16 (GPT Image 2) with short edge >= 1024 (Seedream).
 RATIO_DIMS = {
     "2:3": (1024, 1536),
     "3:4": (1152, 1536),
@@ -31,20 +40,17 @@ RATIO_DIMS = {
     "16:9": (1024, 1824),
 }
 
-# Nano Banana uses aspect-ratio strings (portrait form here; flipped for landscape).
 ASPECT_MAP = {
     "2:3": "2:3", "3:4": "3:4", "4:5": "4:5",
     "5:7": "3:4", "11:14": "4:5", "A-Series": "2:3",
     "Square": "1:1", "16:9": "9:16",
 }
 
-# Each model needs its correct fal endpoint + its own parameter style.
-# The frontend keeps sending its friendly id; the backend translates here.
 MODEL_CONFIG = {
     "openai/gpt-image-2": {
         "endpoint": "openai/gpt-image-2",
         "size": "image_size",
-        "extra": {"quality": "medium"},   # "high" is much slower; "medium" is a good default
+        "extra": {"quality": "medium"},
     },
     "fal-ai/flux-2-pro": {
         "endpoint": "fal-ai/flux-2-pro",
@@ -76,13 +82,13 @@ def home():
         "anthropic_key_set": bool(ANTHROPIC_API_KEY),
         "fal_key_set": bool(FAL_KEY),
         "model": ANTHROPIC_MODEL,
+        "upscaler": FAL_UPSCALER,
     })
 
 
 @app.route("/api/download", methods=["GET"])
 def download():
-    """Fetch an image server-side and return it as a real file download.
-    Avoids the browser's cross-origin download block on fal.ai URLs."""
+    """Fetch an image server-side and return it as a real file download."""
     url = request.args.get("url", "")
     filename = request.args.get("filename", "image.png")
     if not url:
@@ -93,15 +99,84 @@ def download():
             return jsonify({"error": f"fetch failed {r.status_code}"}), 502
         content_type = r.headers.get("Content-Type", "image/png")
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:100] or "image.png"
-        return Response(
-            r.content,
-            headers={
-                "Content-Type": content_type,
-                "Content-Disposition": f'attachment; filename="{safe}"',
-            },
-        )
+        return Response(r.content, headers={
+            "Content-Type": content_type,
+            "Content-Disposition": f'attachment; filename="{safe}"',
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/finalize", methods=["GET"])
+def finalize():
+    """Take an (already AI-upscaled) image, center-crop to the print aspect,
+    resize to the exact print pixels, embed 300 DPI, and return as a download."""
+    url = request.args.get("url", "")
+    size = request.args.get("size", "")
+    filename = request.args.get("filename", "artwork.png")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        r = requests.get(url, timeout=90)
+        if r.status_code != 200:
+            return jsonify({"error": f"fetch failed {r.status_code}"}), 502
+
+        img = Image.open(io.BytesIO(r.content))
+        has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        img = img.convert("RGBA" if has_alpha else "RGB")
+
+        target = parse_target_px(size)
+        if target:
+            tw, th = cap_pixels(*target)
+            img = crop_to_aspect(img, tw, th)
+            img = img.resize((tw, th), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", dpi=(300, 300))
+        buf.seek(0)
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:100] or "artwork.png"
+        return Response(buf.getvalue(), headers={
+            "Content-Type": "image/png",
+            "Content-Disposition": f'attachment; filename="{safe}"',
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def parse_target_px(label):
+    """'16x24' -> 4800x7200 (inches*300). 'A4 (8.3x11.7)' -> 2490x3510.
+    'Etsy 3000x2250 px' -> 3000x2250 (already pixels)."""
+    m = re.search(r"(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)", label or "")
+    if not m:
+        return None
+    w = float(m.group(1))
+    h = float(m.group(2))
+    if "px" in (label or "").lower():
+        return int(round(w)), int(round(h))
+    return int(round(w * 300)), int(round(h * 300))
+
+
+def cap_pixels(w, h):
+    if w * h <= MAX_PIXELS:
+        return w, h
+    scale = (MAX_PIXELS / float(w * h)) ** 0.5
+    return max(1, int(w * scale)), max(1, int(h * scale))
+
+
+def crop_to_aspect(img, tw, th):
+    """Center-crop img so its aspect matches tw:th (no borders)."""
+    iw, ih = img.size
+    target_ar = tw / float(th)
+    src_ar = iw / float(ih)
+    if abs(src_ar - target_ar) < 1e-3:
+        return img
+    if src_ar > target_ar:           # too wide -> trim sides
+        new_w = int(round(ih * target_ar))
+        left = (iw - new_w) // 2
+        return img.crop((left, 0, left + new_w, ih))
+    new_h = int(round(iw / target_ar))  # too tall -> trim top/bottom
+    top = (ih - new_h) // 2
+    return img.crop((0, top, iw, top + new_h))
 
 
 @app.route("/api", methods=["POST"])
@@ -117,6 +192,8 @@ def api():
         return poll_images(data)
     if action == "cancel-images":
         return cancel_images(data)
+    if action == "upscale-start":
+        return upscale_start(data)
     if action == "remove-background":
         return remove_background(data)
 
@@ -198,10 +275,39 @@ def parse_prompts(text):
 
 
 # ---------------------------------------------------------------------------
+# fal queue helper
+# ---------------------------------------------------------------------------
+def _submit_job(endpoint, payload):
+    """Submit one fal queue job. Returns (job_dict, error_string) -- one is None."""
+    try:
+        r = requests.post(
+            f"https://queue.fal.run/{endpoint}",
+            headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code not in (200, 201):
+            return None, f"{endpoint} {r.status_code}: {r.text[:200]}"
+        body = r.json()
+        rid = body.get("request_id")
+        if not rid:
+            return None, f"No request_id: {str(body)[:200]}"
+        base = f"https://queue.fal.run/{endpoint}/requests/{rid}"
+        job = {
+            "request_id": rid,
+            "status_url": body.get("status_url") or f"{base}/status",
+            "response_url": body.get("response_url") or base,
+            "cancel_url": body.get("cancel_url") or f"{base}/cancel",
+        }
+        return job, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ---------------------------------------------------------------------------
 # 2) Generate images with fal.ai (queue: submit fast, poll later)
 # ---------------------------------------------------------------------------
 def build_input(model, ratio, prompt, orientation="Portrait"):
-    """Return (fal_endpoint, input_payload) tailored to the chosen model."""
     cfg = MODEL_CONFIG.get(model)
     payload = {"prompt": prompt, "num_images": 1}
     landscape = str(orientation).lower() == "landscape"
@@ -241,41 +347,13 @@ def generate_images(data):
         return jsonify({"jobs": [], "error": "Missing prompts or model"}), 200
 
     jobs, errors = [], []
-
     for p in prompts:
         endpoint, payload = build_input(model, ratio, p, orientation)
-        try:
-            r = requests.post(
-                f"https://queue.fal.run/{endpoint}",
-                headers={"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"},
-                json=payload,
-                timeout=30,
-            )
-            if r.status_code not in (200, 201):
-                errors.append(f"{endpoint} {r.status_code}: {r.text[:200]}")
-                continue
-            body = r.json()
-            rid = body.get("request_id")
-            status_url = body.get("status_url")
-            response_url = body.get("response_url")
-            cancel_url = body.get("cancel_url")
-            if rid and status_url and response_url:
-                job = {"request_id": rid, "status_url": status_url, "response_url": response_url}
-                if cancel_url:
-                    job["cancel_url"] = cancel_url
-                jobs.append(job)
-            elif rid:
-                base = f"https://queue.fal.run/{endpoint}/requests/{rid}"
-                jobs.append({
-                    "request_id": rid,
-                    "status_url": f"{base}/status",
-                    "response_url": base,
-                    "cancel_url": f"{base}/cancel",
-                })
-            else:
-                errors.append(f"No request_id: {str(body)[:200]}")
-        except Exception as e:
-            errors.append(str(e))
+        job, err = _submit_job(endpoint, payload)
+        if job:
+            jobs.append(job)
+        elif err:
+            errors.append(err)
 
     out = {"jobs": jobs}
     if errors:
@@ -310,11 +388,17 @@ def poll_images(data):
                 if res.status_code == 200:
                     rb = res.json()
                     found = False
+                    # Single image object (upscalers, bg-removal)
+                    img_obj = rb.get("image")
+                    if isinstance(img_obj, dict) and img_obj.get("url"):
+                        images.append(img_obj["url"]); found = True
+                    elif isinstance(img_obj, str) and img_obj:
+                        images.append(img_obj); found = True
+                    # List of images (generators)
                     for img in rb.get("images", []):
                         url = img.get("url") if isinstance(img, dict) else img
                         if url:
-                            images.append(url)
-                            found = True
+                            images.append(url); found = True
                     if not found:
                         errors.append(f"Completed but no image url: {str(rb)[:200]}")
                 else:
@@ -331,8 +415,6 @@ def poll_images(data):
 
 
 def cancel_images(data):
-    """Ask fal to cancel jobs still waiting in the queue (saves cost).
-    Jobs already running can't be un-billed, but queued ones can be stopped."""
     jobs = data.get("jobs", [])
     if not FAL_KEY:
         return jsonify({"cancelled": 0, "errors": ["FAL_KEY is not set on the server"]}), 200
@@ -356,7 +438,34 @@ def cancel_images(data):
 
 
 # ---------------------------------------------------------------------------
-# 3) Remove background with fal.ai (Bria RMBG)
+# 3) Upscale (AI) -- submit jobs; frontend polls with poll-images
+# ---------------------------------------------------------------------------
+def upscale_start(data):
+    image_urls = data.get("image_urls", [])
+    if not FAL_KEY:
+        return jsonify({"jobs": [], "error": "FAL_KEY is not set on the server"}), 200
+    if not image_urls:
+        return jsonify({"jobs": [], "error": "No images to upscale"}), 200
+
+    jobs, errors = [], []
+    for url in image_urls:
+        payload = {"image_url": url}
+        if "clarity" in FAL_UPSCALER or "ccsr" in FAL_UPSCALER:
+            payload["scale"] = 4
+        job, err = _submit_job(FAL_UPSCALER, payload)
+        if job:
+            jobs.append(job)
+        elif err:
+            errors.append(err)
+
+    out = {"jobs": jobs}
+    if errors:
+        out["error"] = " | ".join(errors[:4])
+    return jsonify(out), 200
+
+
+# ---------------------------------------------------------------------------
+# 4) Remove background with fal.ai (Bria RMBG)
 # ---------------------------------------------------------------------------
 def remove_background(data):
     image_urls = data.get("image_urls", [])
