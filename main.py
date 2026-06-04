@@ -17,8 +17,9 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 
-# Aspect ratio -> (width, height). All multiples of 16 (required by GPT Image 2)
-# with the short edge kept >= 1024 (required by Seedream).
+# Aspect ratio -> (width, height) in PORTRAIT form (width <= height). All
+# multiples of 16 (GPT Image 2) with short edge >= 1024 (Seedream). When the
+# user picks Landscape, the backend swaps width<->height.
 RATIO_DIMS = {
     "2:3": (1024, 1536),
     "3:4": (1152, 1536),
@@ -27,15 +28,14 @@ RATIO_DIMS = {
     "11:14": (1216, 1536),
     "A-Series": (1088, 1536),
     "Square": (1024, 1024),
-    "16:9": (1824, 1024),
+    "16:9": (1024, 1824),
 }
 
-# Nano Banana uses aspect-ratio strings, not pixel sizes. Map each ratio to the
-# nearest value fal supports: auto,21:9,16:9,3:2,4:3,5:4,1:1,4:5,3:4,2:3,9:16
+# Nano Banana uses aspect-ratio strings (portrait form here; flipped for landscape).
 ASPECT_MAP = {
     "2:3": "2:3", "3:4": "3:4", "4:5": "4:5",
     "5:7": "3:4", "11:14": "4:5", "A-Series": "2:3",
-    "Square": "1:1", "16:9": "16:9",
+    "Square": "1:1", "16:9": "9:16",
 }
 
 # Each model needs its correct fal endpoint + its own parameter style.
@@ -129,6 +129,7 @@ def api():
 def generate_prompts(data):
     description = (data.get("description") or "").strip()
     ratio = (data.get("ratio") or "").strip()
+    orientation = (data.get("orientation") or "Portrait").strip()
 
     if not ANTHROPIC_API_KEY:
         return jsonify({"prompts": [], "error": "ANTHROPIC_API_KEY is not set on the server"}), 200
@@ -139,8 +140,9 @@ def generate_prompts(data):
         "You write prompts for an AI image generator that creates beautiful, "
         "print-ready wall art.\n\n"
         f"Customer description: {description}\n"
-        f"Aspect ratio: {ratio or 'unspecified'}\n\n"
+        f"Aspect ratio: {ratio or 'unspecified'} ({orientation})\n\n"
         "Write 4 distinct, vivid image-generation prompts based on the description. "
+        f"Compose each for a {orientation.lower()} orientation. "
         "Each prompt should be 2-3 sentences and specify subject, style, mood, color "
         "palette, lighting, and composition. Vary the artistic style across the 4 so "
         "the customer has real choices.\n\n"
@@ -198,22 +200,30 @@ def parse_prompts(text):
 # ---------------------------------------------------------------------------
 # 2) Generate images with fal.ai (queue: submit fast, poll later)
 # ---------------------------------------------------------------------------
-def build_input(model, ratio, prompt):
+def build_input(model, ratio, prompt, orientation="Portrait"):
     """Return (fal_endpoint, input_payload) tailored to the chosen model."""
     cfg = MODEL_CONFIG.get(model)
     payload = {"prompt": prompt, "num_images": 1}
+    landscape = str(orientation).lower() == "landscape"
 
     if cfg is None:
-        # Unknown model -> default to FLUX-style {width,height}.
         w, h = RATIO_DIMS.get(ratio, (1024, 1024))
+        if landscape:
+            w, h = h, w
         payload["image_size"] = {"width": w, "height": h}
         return model, payload
 
     if cfg["size"] == "image_size":
         w, h = RATIO_DIMS.get(ratio, (1024, 1024))
+        if landscape:
+            w, h = h, w
         payload["image_size"] = {"width": w, "height": h}
     elif cfg["size"] == "aspect_ratio":
-        payload["aspect_ratio"] = ASPECT_MAP.get(ratio, "1:1")
+        asp = ASPECT_MAP.get(ratio, "1:1")
+        if landscape and ":" in asp:
+            a, b = asp.split(":")
+            asp = f"{b}:{a}"
+        payload["aspect_ratio"] = asp
 
     payload.update(cfg.get("extra", {}))
     return cfg["endpoint"], payload
@@ -223,6 +233,7 @@ def generate_images(data):
     prompts = data.get("prompts", [])
     model = (data.get("model") or "").strip()
     ratio = (data.get("ratio") or "Square").strip()
+    orientation = (data.get("orientation") or "Portrait").strip()
 
     if not FAL_KEY:
         return jsonify({"jobs": [], "error": "FAL_KEY is not set on the server"}), 200
@@ -232,7 +243,7 @@ def generate_images(data):
     jobs, errors = [], []
 
     for p in prompts:
-        endpoint, payload = build_input(model, ratio, p)
+        endpoint, payload = build_input(model, ratio, p, orientation)
         try:
             r = requests.post(
                 f"https://queue.fal.run/{endpoint}",
