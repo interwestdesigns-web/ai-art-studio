@@ -21,6 +21,10 @@ ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # detail enhancement (it can invent detail). Overridable without code changes.
 FAL_UPSCALER = os.environ.get("FAL_UPSCALER", "fal-ai/aura-sr")
 
+# Instruction-based image editor ("change X, keep the rest"). Overridable;
+# "fal-ai/flux-pro/kontext/max" is a higher-quality (pricier) option.
+FAL_KONTEXT = os.environ.get("FAL_KONTEXT", "fal-ai/flux-pro/kontext")
+
 # Safety cap on final image size (pixels) to protect server memory. 40MP covers
 # up to ~16x20 / 18x24 at full 300 DPI. Raise if your Railway plan has the RAM.
 MAX_PIXELS = int(os.environ.get("MAX_PIXELS", "40000000"))
@@ -194,6 +198,8 @@ def api():
         return cancel_images(data)
     if action == "upscale-start":
         return upscale_start(data)
+    if action == "edit-image":
+        return edit_image(data)
     if action == "remove-background":
         return remove_background(data)
 
@@ -368,6 +374,10 @@ def generate_images(data):
         endpoint, payload = build_input(model, ratio, p, orientation)
         job, err = _submit_job(endpoint, payload)
         if job:
+            job["prompt"] = p
+            job["model"] = model
+            job["ratio"] = ratio
+            job["orientation"] = orientation
             jobs.append(job)
         elif err:
             errors.append(err)
@@ -381,9 +391,9 @@ def generate_images(data):
 def poll_images(data):
     jobs = data.get("jobs", [])
     if not FAL_KEY:
-        return jsonify({"images": [], "jobs": [], "errors": ["FAL_KEY is not set on the server"]}), 200
+        return jsonify({"images": [], "results": [], "jobs": [], "errors": ["FAL_KEY is not set on the server"]}), 200
 
-    images, pending, errors = [], [], []
+    images, results, pending, errors = [], [], [], []
     auth = {"Authorization": f"Key {FAL_KEY}"}
 
     for job in jobs:
@@ -404,19 +414,27 @@ def poll_images(data):
                 res = requests.get(response_url, headers=auth, timeout=60)
                 if res.status_code == 200:
                     rb = res.json()
-                    found = False
-                    # Single image object (upscalers, bg-removal)
+                    urls = []
                     img_obj = rb.get("image")
                     if isinstance(img_obj, dict) and img_obj.get("url"):
-                        images.append(img_obj["url"]); found = True
+                        urls.append(img_obj["url"])
                     elif isinstance(img_obj, str) and img_obj:
-                        images.append(img_obj); found = True
-                    # List of images (generators)
+                        urls.append(img_obj)
                     for img in rb.get("images", []):
-                        url = img.get("url") if isinstance(img, dict) else img
-                        if url:
-                            images.append(url); found = True
-                    if not found:
+                        u = img.get("url") if isinstance(img, dict) else img
+                        if u:
+                            urls.append(u)
+                    if urls:
+                        for u in urls:
+                            images.append(u)
+                            results.append({
+                                "url": u,
+                                "prompt": job.get("prompt"),
+                                "model": job.get("model"),
+                                "ratio": job.get("ratio"),
+                                "orientation": job.get("orientation"),
+                            })
+                    else:
                         errors.append(f"Completed but no image url: {str(rb)[:200]}")
                 else:
                     errors.append(f"Result fetch {res.status_code}: {res.text[:200]}")
@@ -428,7 +446,7 @@ def poll_images(data):
             pending.append(job)
             errors.append(str(e))
 
-    return jsonify({"images": images, "jobs": pending, "errors": errors}), 200
+    return jsonify({"images": images, "results": results, "jobs": pending, "errors": errors}), 200
 
 
 def cancel_images(data):
@@ -457,6 +475,24 @@ def cancel_images(data):
 # ---------------------------------------------------------------------------
 # 3) Upscale (AI) -- submit jobs; frontend polls with poll-images
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Edit an image with an instruction (FLUX Kontext) -- frontend polls as usual
+# ---------------------------------------------------------------------------
+def edit_image(data):
+    image_url = (data.get("image_url") or "").strip()
+    instruction = (data.get("instruction") or "").strip()
+    if not FAL_KEY:
+        return jsonify({"jobs": [], "error": "FAL_KEY is not set on the server"}), 200
+    if not image_url or not instruction:
+        return jsonify({"jobs": [], "error": "Need both an image and an instruction"}), 200
+
+    job, err = _submit_job(FAL_KONTEXT, {"prompt": instruction, "image_url": image_url})
+    out = {"jobs": [job] if job else []}
+    if err:
+        out["error"] = err
+    return jsonify(out), 200
+
+
 def upscale_start(data):
     image_urls = data.get("image_urls", [])
     if not FAL_KEY:
