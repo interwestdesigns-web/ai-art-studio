@@ -170,8 +170,22 @@ def generate_images(data):
                 continue
             body = r.json()
             rid = body.get("request_id")
-            if rid:
-                jobs.append({"request_id": rid, "model": model})
+            status_url = body.get("status_url")
+            response_url = body.get("response_url")
+            if rid and status_url and response_url:
+                # Use the URLs fal hands back -- never construct them by hand.
+                jobs.append({
+                    "request_id": rid,
+                    "status_url": status_url,
+                    "response_url": response_url,
+                })
+            elif rid:
+                # Fallback if fal omits the URLs (uses base app id, not subpaths).
+                jobs.append({
+                    "request_id": rid,
+                    "status_url": f"https://queue.fal.run/{model}/requests/{rid}/status",
+                    "response_url": f"https://queue.fal.run/{model}/requests/{rid}",
+                })
             else:
                 errors.append(f"No request_id in response: {str(body)[:200]}")
         except Exception as e:
@@ -189,27 +203,25 @@ def poll_images(data):
         return jsonify({"images": [], "jobs": [], "errors": ["FAL_KEY is not set on the server"]}), 200
 
     images, pending, errors = [], [], []
+    auth = {"Authorization": f"Key {FAL_KEY}"}
 
     for job in jobs:
-        rid = job.get("request_id")
-        model = job.get("model")
-        if not rid or not model:
+        status_url = job.get("status_url")
+        response_url = job.get("response_url")
+        if not status_url or not response_url:
+            errors.append(f"Job missing URLs: {str(job)[:150]}")
             continue
         try:
-            s = requests.get(
-                f"https://queue.fal.run/{model}/requests/{rid}/status",
-                headers={"Authorization": f"Key {FAL_KEY}"},
-                timeout=30,
-            )
-            sbody = s.json() if s.status_code == 200 else {}
+            s = requests.get(status_url, headers=auth, timeout=30)
+            if s.status_code != 200:
+                # Surface the real reason instead of guessing.
+                errors.append(f"Status check {s.status_code}: {s.text[:200]}")
+                continue
+            sbody = s.json()
             status = sbody.get("status")
 
             if status == "COMPLETED":
-                res = requests.get(
-                    f"https://queue.fal.run/{model}/requests/{rid}",
-                    headers={"Authorization": f"Key {FAL_KEY}"},
-                    timeout=60,
-                )
+                res = requests.get(response_url, headers=auth, timeout=60)
                 if res.status_code == 200:
                     rb = res.json()
                     found = False
