@@ -2,7 +2,7 @@ import os
 import re
 import json
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -77,6 +77,31 @@ def home():
         "fal_key_set": bool(FAL_KEY),
         "model": ANTHROPIC_MODEL,
     })
+
+
+@app.route("/api/download", methods=["GET"])
+def download():
+    """Fetch an image server-side and return it as a real file download.
+    Avoids the browser's cross-origin download block on fal.ai URLs."""
+    url = request.args.get("url", "")
+    filename = request.args.get("filename", "image.png")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        r = requests.get(url, timeout=60)
+        if r.status_code != 200:
+            return jsonify({"error": f"fetch failed {r.status_code}"}), 502
+        content_type = r.headers.get("Content-Type", "image/png")
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:100] or "image.png"
+        return Response(
+            r.content,
+            headers={
+                "Content-Type": content_type,
+                "Content-Disposition": f'attachment; filename="{safe}"',
+            },
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api", methods=["POST"])
