@@ -213,8 +213,8 @@ def poll_images(data):
             continue
         try:
             s = requests.get(status_url, headers=auth, timeout=30)
-            if s.status_code != 200:
-                # Surface the real reason instead of guessing.
+            if s.status_code not in (200, 202):
+                # 200/202 both carry a valid status body; anything else is a real error.
                 errors.append(f"Status check {s.status_code}: {s.text[:200]}")
                 continue
             sbody = s.json()
