@@ -190,6 +190,8 @@ def api():
 
     if action == "generate-prompts":
         return generate_prompts(data)
+    if action == "describe-image":
+        return describe_image(data)
     if action == "generate-images":
         return generate_images(data)
     if action == "poll-images":
@@ -283,6 +285,64 @@ def generate_prompts(data):
         return jsonify({"prompts": [], "error": f"Could not parse prompts: {text[:300]}"}), 200
 
     return jsonify({"prompts": prompts[:4]}), 200
+
+
+def describe_image(data):
+    """Look at the uploaded image(s) and return a rich description the user can
+    paste/edit in the Describe box."""
+    images = data.get("images", []) or []
+    if not ANTHROPIC_API_KEY:
+        return jsonify({"description": "", "error": "ANTHROPIC_API_KEY is not set on the server"}), 200
+    if not images:
+        return jsonify({"description": "", "error": "No image provided"}), 200
+
+    instruction = (
+        "Describe the attached image in vivid detail, written as an image-generation "
+        "prompt for wall art. Cover the subject, art style, composition, color palette, "
+        "lighting, and mood in 3-5 sentences, as one flowing paragraph I could paste "
+        "straight into an image generator. Return ONLY the description text -- no "
+        "preamble, no quotes, no labels."
+    )
+
+    content = []
+    for im in images[:6]:
+        b64 = im.get("data") or ""
+        mt = im.get("media_type") or "image/jpeg"
+        if b64:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}})
+    content.append({"type": "text", "text": instruction})
+
+    try:
+        resp = requests.post(
+            ANTHROPIC_URL,
+            headers={
+                "content-type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": ANTHROPIC_MODEL,
+                "max_tokens": 700,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=90,
+        )
+    except Exception as e:
+        return jsonify({"description": "", "error": f"Request to Anthropic failed: {e}"}), 200
+
+    if resp.status_code != 200:
+        return jsonify({"description": "", "error": f"Anthropic API {resp.status_code}: {resp.text[:400]}"}), 200
+
+    payload = resp.json()
+    text = "".join(
+        block.get("text", "")
+        for block in payload.get("content", [])
+        if block.get("type") == "text"
+    ).strip()
+
+    if not text:
+        return jsonify({"description": "", "error": "No description returned"}), 200
+    return jsonify({"description": text}), 200
 
 
 def parse_prompts(text):
