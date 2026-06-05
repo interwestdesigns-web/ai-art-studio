@@ -79,6 +79,14 @@ MODEL_CONFIG = {
 }
 
 
+# Models with a native reference/edit endpoint on fal (take image_urls + prompt).
+# Others fall back to FLUX Kontext for reference-based generation.
+MODEL_EDIT_CONFIG = {
+    "fal-ai/nano-banana-pro": "fal-ai/nano-banana-pro/edit",
+    "fal-ai/seedream-v4-5": "fal-ai/bytedance/seedream/v4/edit",
+}
+
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -457,15 +465,38 @@ def generate_images(data):
     model = (data.get("model") or "").strip()
     ratio = (data.get("ratio") or "Square").strip()
     orientation = (data.get("orientation") or "Portrait").strip()
+    reference_images = data.get("reference_images", []) or []
+    reference_mode = (data.get("reference_mode") or "kontext").strip()
 
     if not FAL_KEY:
         return jsonify({"jobs": [], "error": "FAL_KEY is not set on the server"}), 200
     if not prompts or not model:
         return jsonify({"jobs": [], "error": "Missing prompts or model"}), 200
 
+    # Build reference data-URIs (fal accepts base64 data URIs for image inputs).
+    reference_urls = []
+    for im in reference_images:
+        b64 = im.get("data") or ""
+        mt = im.get("media_type") or "image/jpeg"
+        if b64:
+            reference_urls.append(f"data:{mt};base64,{b64}")
+
+    note = None
     jobs, errors = [], []
     for p in prompts:
-        endpoint, payload = build_input(model, ratio, p, orientation)
+        if reference_urls:
+            if reference_mode == "native":
+                edit_ep = MODEL_EDIT_CONFIG.get(model)
+                if edit_ep:
+                    endpoint, payload = edit_ep, {"prompt": p, "image_urls": reference_urls}
+                else:
+                    endpoint, payload = FAL_KONTEXT, {"prompt": p, "image_url": reference_urls[0]}
+                    note = "Selected model has no native reference mode on fal -- used FLUX Kontext instead."
+            else:
+                endpoint, payload = FAL_KONTEXT, {"prompt": p, "image_url": reference_urls[0]}
+        else:
+            endpoint, payload = build_input(model, ratio, p, orientation)
+
         job, err = _submit_job(endpoint, payload)
         if job:
             job["prompt"] = p
@@ -479,6 +510,8 @@ def generate_images(data):
     out = {"jobs": jobs}
     if errors:
         out["error"] = " | ".join(errors[:4])
+    if note:
+        out["note"] = note
     return jsonify(out), 200
 
 
