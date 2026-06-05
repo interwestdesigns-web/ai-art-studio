@@ -307,22 +307,36 @@ def describe_image(data):
         return jsonify({"description": "", "error": "No image provided"}), 200
 
     instructions = (data.get("instructions") or "").strip()
-    instruction = (
-        "Describe the attached image in vivid detail, written as an image-generation "
-        "prompt for wall art. Aim for a faithful description so a generator could closely "
-        "recreate it. Cover the subject, art style, composition, color palette, lighting, "
-        "and mood in 3-5 sentences, as one flowing paragraph I could paste straight into "
-        "an image generator."
-    )
-    if instructions:
-        instruction += (
-            f"\n\nAlso follow these instructions from the user: {instructions}\n"
-            "If any are things to avoid (e.g. no text, no borders, no people, no watermark), "
-            "state them directly in the prompt as explicit exclusions -- these image models "
-            "don't accept a separate negative prompt, so exclusions must be written into the "
-            "description itself."
+    mode = (data.get("mode") or "description").strip()
+
+    if mode == "style-notes":
+        instruction = (
+            "Look at the attached image and write concise STYLE NOTES an image generator can use "
+            "to match this image's look. In about 25-45 words capture (1) the art style/medium and "
+            "(2) the color palette. Then append clean-wall-art exclusions: full-bleed, no borders or "
+            "frame, no text or words, no watermark or signature, and no people (unless people are "
+            "clearly the main subject of the image). Phrase exclusions as 'no X'."
         )
-    instruction += "\n\nReturn ONLY the description text -- no preamble, no quotes, no labels."
+        if instructions:
+            instruction += f"\n\nAlso incorporate these user preferences: {instructions}"
+        instruction += "\n\nReturn ONLY the notes text -- no preamble, no quotes, no labels."
+    else:
+        instruction = (
+            "Describe the attached image in vivid detail, written as an image-generation "
+            "prompt for wall art. Aim for a faithful description so a generator could closely "
+            "recreate it. Cover the subject, art style, composition, color palette, lighting, "
+            "and mood in 3-5 sentences, as one flowing paragraph I could paste straight into "
+            "an image generator."
+        )
+        if instructions:
+            instruction += (
+                f"\n\nAlso follow these instructions from the user: {instructions}\n"
+                "If any are things to avoid (e.g. no text, no borders, no people, no watermark), "
+                "state them directly in the prompt as explicit exclusions -- these image models "
+                "don't accept a separate negative prompt, so exclusions must be written into the "
+                "description itself."
+            )
+        instruction += "\n\nReturn ONLY the description text -- no preamble, no quotes, no labels."
 
     content = []
     for im in images[:6]:
