@@ -216,6 +216,7 @@ def generate_prompts(data):
     ratio = (data.get("ratio") or "").strip()
     orientation = (data.get("orientation") or "Portrait").strip()
     images = data.get("images", []) or []
+    constraints = (data.get("constraints") or "").strip()
 
     if not ANTHROPIC_API_KEY:
         return jsonify({"prompts": [], "error": "ANTHROPIC_API_KEY is not set on the server"}), 200
@@ -229,6 +230,14 @@ def generate_prompts(data):
     else:
         intro = f"Customer description: {description}\n"
 
+    constraint_clause = ""
+    if constraints:
+        constraint_clause = (
+            f"\n\nEVERY prompt must honor these style notes and exclusions: {constraints}\n"
+            "Write any 'no X' items directly into each prompt as explicit exclusions "
+            "(these models don't use a separate negative prompt)."
+        )
+
     instruction = (
         "You write prompts for an AI image generator that creates beautiful, "
         "print-ready wall art.\n\n"
@@ -238,8 +247,9 @@ def generate_prompts(data):
         f"Compose each for a {orientation.lower()} orientation. "
         "Each prompt should be 2-3 sentences and specify subject, style, mood, color "
         "palette, lighting, and composition. Vary the artistic style across the 4 so "
-        "the customer has real choices.\n\n"
-        "Return ONLY a JSON array of 4 strings and nothing else -- no markdown, no keys, "
+        "the customer has real choices."
+        + constraint_clause +
+        "\n\nReturn ONLY a JSON array of 4 strings and nothing else -- no markdown, no keys, "
         "no commentary. Example: [\"prompt one\", \"prompt two\", \"prompt three\", \"prompt four\"]"
     )
 
@@ -296,13 +306,23 @@ def describe_image(data):
     if not images:
         return jsonify({"description": "", "error": "No image provided"}), 200
 
+    instructions = (data.get("instructions") or "").strip()
     instruction = (
         "Describe the attached image in vivid detail, written as an image-generation "
-        "prompt for wall art. Cover the subject, art style, composition, color palette, "
-        "lighting, and mood in 3-5 sentences, as one flowing paragraph I could paste "
-        "straight into an image generator. Return ONLY the description text -- no "
-        "preamble, no quotes, no labels."
+        "prompt for wall art. Aim for a faithful description so a generator could closely "
+        "recreate it. Cover the subject, art style, composition, color palette, lighting, "
+        "and mood in 3-5 sentences, as one flowing paragraph I could paste straight into "
+        "an image generator."
     )
+    if instructions:
+        instruction += (
+            f"\n\nAlso follow these instructions from the user: {instructions}\n"
+            "If any are things to avoid (e.g. no text, no borders, no people, no watermark), "
+            "state them directly in the prompt as explicit exclusions -- these image models "
+            "don't accept a separate negative prompt, so exclusions must be written into the "
+            "description itself."
+        )
+    instruction += "\n\nReturn ONLY the description text -- no preamble, no quotes, no labels."
 
     content = []
     for im in images[:6]:
